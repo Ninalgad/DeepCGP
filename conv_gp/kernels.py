@@ -3,19 +3,26 @@ import tensorflow as tf
 import gpflow
 from gpflow import settings
 from gpflow.features import InducingPointsBase
-from gpflow.multioutput.features import SeparateIndependentMof
-from gpflow.params import Parameter
+from types import GeneratorType
 from gpflow.dispatch import dispatch
 from sklearn import cluster
+from random import randint
 
-def _sample(tensor, count):
-    chosen_indices = np.random.choice(np.arange(tensor.shape[0]), count)
-    return tensor[chosen_indices]
+
+def _sample(tensor, count=1):
+    if isinstance(tensor, GeneratorType):
+        images, _ = next(tensor)
+        return images[[randint(0, images.shape[0] - 1)]]
+    else:
+        chosen_indices = np.random.choice(np.arange(tensor.shape[0]), count)
+        return tensor[chosen_indices]
+
 
 class AdditivePatchKernel(gpflow.kernels.Kernel):
     """This conv kernel sums over each patch assuming the output is produced independently from each patch.
         K(x, x') = \sum_{i} w_i k(x[i], x'[i])
     """
+
     def __init__(self, base_kernel, view, patch_weights=None):
         super().__init__(input_dim=np.prod(view.input_size))
         self.base_kernel = base_kernel
@@ -26,9 +33,12 @@ class AdditivePatchKernel(gpflow.kernels.Kernel):
         if patch_weights is None or patch_weights.size != self.patch_count:
             patch_weights = np.ones(self.patch_count, dtype=settings.float_type)
         self.patch_weights = gpflow.Param(patch_weights)
+        self.pw = patch_weights
 
     def _reshape_X(self, ND_X):
         ND = tf.shape(ND_X)
+        print(ND_X)
+        print([ND[0]], list(self.view.input_size))
         return tf.reshape(ND_X, [ND[0]] + list(self.view.input_size))
 
     def K(self, ND_X, X2=None):
@@ -46,35 +56,39 @@ class AdditivePatchKernel(gpflow.kernels.Kernel):
             return weight * self.base_kernel.K(NL_patches1, NL_patches2)
 
         PNN_K = tf.map_fn(compute_K, (PNL_patches, PNL_patches2, self.patch_weights), settings.float_type,
-                parallel_iterations=self.patch_count)
+                          parallel_iterations=self.patch_count)
 
         return tf.reduce_mean(PNN_K, [0])
 
     def Kdiag(self, ND_X):
         NHWC_X = self._reshape_X(ND_X)
         PNL_patches = self.view.extract_patches_PNL(NHWC_X)
+
         def compute_Kdiag(tupled):
             NL_patches, weight = tupled
             return weight * self.base_kernel.Kdiag(NL_patches)
+
         PN_K = tf.map_fn(compute_Kdiag, (PNL_patches, self.patch_weights), settings.float_type,
-                parallel_iterations=self.patch_count)
+                         parallel_iterations=self.patch_count)
         return tf.reduce_mean(PN_K, [0])
 
     def Kzx(self, ML_Z, ND_X):
         NHWC_X = self._reshape_X(ND_X)
         # Patches: N x patch_count x patch_length
         PNL_patches = self.view.extract_patches_PNL(NHWC_X)
+
         def compute_Kuf(tupled):
             NL_patches, weight = tupled
             return weight * self.base_kernel.K(ML_Z, NL_patches)
 
         KMN_Kuf = tf.map_fn(compute_Kuf, (PNL_patches, self.patch_weights), settings.float_type,
-                parallel_iterations=self.patch_count)
+                            parallel_iterations=self.patch_count)
 
         return tf.reduce_mean(KMN_Kuf, [0])
 
     def Kzz(self, Z):
         return self.base_kernel.K(Z)
+
 
 class ConvKernel(AdditivePatchKernel):
     # Loosely based on https://github.com/markvdw/convgp/blob/master/convgp/convkernels.py
@@ -95,9 +109,9 @@ class ConvKernel(AdditivePatchKernel):
         # Reshape to batch x patch_count x batch x patch_count
         K = tf.reshape(K, (X_shape[0], self.patch_count, X_shape[0], self.patch_count))
 
-        w = self.patch_weights
-        W = w[None, :] * w[:, None] # P x P
-        W = W[None, :, None, :] # 1 x P x 1 x P
+        w = self.pw
+        W = w[None, :] * w[:, None]  # P x P
+        W = W[None, :, None, :]  # 1 x P x 1 x P
         K = K * W
 
         # Sum over the patch dimensions.
@@ -110,8 +124,10 @@ class ConvKernel(AdditivePatchKernel):
         patches = self.view.extract_patches(NHWC_X)
         w = self.patch_weights
         W = w[None, :] * w[:, None]
+
         def sumK(p):
             return tf.reduce_sum(self.base_kernel.K(p) * W)
+
         return tf.map_fn(sumK, patches, parallel_iterations=self.patch_count) / (self.patch_count ** 2)
 
     def Kzx(self, Z, ND_X):
@@ -141,41 +157,46 @@ def _sample_patches(HW_image, N, patch_size, patch_length):
     for i in range(N):
         patch_y = np.random.randint(0, HW_image.shape[0] - patch_size)
         patch_x = np.random.randint(0, HW_image.shape[1] - patch_size)
-        out[i] = HW_image[patch_y:patch_y+patch_size, patch_x:patch_x+patch_size].reshape(patch_length)
+        out[i] = HW_image[patch_y:patch_y + patch_size, patch_x:patch_x + patch_size].reshape(patch_length)
     return out
 
-def _cluster_patches(NHWC_X, M, patch_size):
-        NHWC = NHWC_X.shape
-        patch_length = patch_size ** 2 * NHWC[3]
-        # Randomly sample images and patches.
-        patches = np.zeros((M, patch_length), dtype=settings.float_type)
-        patches_per_image = 1
-        samples_per_inducing_point = 100
-        for i in range(M * samples_per_inducing_point // patches_per_image):
-            # Sample a random image, compute the patches and sample some random patches.
-            image = _sample(NHWC_X, 1)[0]
-            sampled_patches = _sample_patches(image, patches_per_image,
-                    patch_size, patch_length)
-            patches[i*patches_per_image:(i+1)*patches_per_image] = sampled_patches
 
-        k_means = cluster.KMeans(n_clusters=M,
-                init='random', n_jobs=-1)
-        k_means.fit(patches)
-        return k_means.cluster_centers_
+def _cluster_patches(NHWC_X, M, patch_size, shape=None):
+    if shape:
+        NHWC = shape
+    else:
+        NHWC = NHWC_X.shape
+    patch_length = patch_size ** 2 * NHWC[3]
+    # Randomly sample images and patches.
+    patches = np.zeros((M, patch_length), dtype=settings.float_type)
+    patches_per_image = 1
+    samples_per_inducing_point = 100
+    for i in range(M * samples_per_inducing_point // patches_per_image):
+        print('{} of {}'.format(i, M * samples_per_inducing_point // patches_per_image))
+        # Sample a random image, compute the patches and sample some random patches.
+        image = _sample(NHWC_X)[0]
+        sampled_patches = _sample_patches(image, patches_per_image,
+                                          patch_size, patch_length)
+        patches[i * patches_per_image:(i + 1) * patches_per_image] = sampled_patches
+
+    k_means = cluster.KMeans(n_clusters=M,
+                             init='random', n_jobs=-1)
+    k_means.fit(patches)
+    return k_means.cluster_centers_
+
 
 class PatchInducingFeatures(InducingPointsBase):
     @classmethod
-    def from_images(cls, NHWC_X, M, patch_size):
-        features = _cluster_patches(NHWC_X, M, patch_size)
+    def from_images(cls, NHWC_X, M, patch_size, shape=None):
+        features = _cluster_patches(NHWC_X, M, patch_size, shape)
         return PatchInducingFeatures(features)
+
 
 @dispatch(PatchInducingFeatures, AdditivePatchKernel)
 def Kuu(feature, kern, jitter=0.0):
     return kern.Kzz(feature.Z) + tf.eye(len(feature), dtype=settings.dtypes.float_type) * jitter
 
+
 @dispatch(PatchInducingFeatures, AdditivePatchKernel, object)
 def Kuf(feature, kern, Xnew):
     return kern.Kzx(feature.Z, Xnew)
-
-
-
